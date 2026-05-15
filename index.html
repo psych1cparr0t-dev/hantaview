@@ -433,11 +433,11 @@
       <button class="action-btn primary" id="register-btn" style="display:none;">Register Alert Zone</button>
       <div class="confirm-box" id="confirm-msg"></div>
 
-      <div class="section-title">Active Zones<span class="section-subtitle">Saved boundaries — stored in your browser, not transmitted to any server</span></div>
+      <div class="section-title">Active Zones<span class="section-subtitle">Registered boundaries — stored server-side, matched on every hourly data refresh</span></div>
       <div id="zone-list"></div>
 
       <div class="tab-footer">
-        Zone boundaries and contact addresses are stored in browser local storage only. No personal data is transmitted to external servers. Alert matching runs client-side against the surveillance dataset each time the page loads. Email delivery infrastructure is pending — registered zones will be matched against future data updates when notification service is enabled.
+        Zone boundaries and email addresses are stored on the Hantaview server and matched against surveillance data every hour. Email alerts are delivered via <a href="https://resend.com" target="_blank" rel="noopener" style="color:#20c9c9;">Resend</a>. You can unsubscribe at any time using the link in any alert email, or by clicking the × next to your zone above. Maximum 5 zones per email address.
       </div>
     </div>
 
@@ -776,7 +776,18 @@ const ZONES_KEY = 'hantaview_alert_zones';
 let savedZones = JSON.parse(localStorage.getItem(ZONES_KEY) || '[]');
 let pendingBounds = null;
 let pendingLayer = null;
+let activeDrawHandler = null;
 const drawnZonesGroup = L.featureGroup().addTo(map);
+
+function cancelDraw() {
+  if (activeDrawHandler) { activeDrawHandler.disable(); activeDrawHandler = null; }
+  const btn = document.getElementById('draw-zone-btn');
+  if (btn) {
+    btn.textContent = pendingBounds ? '↺  Redraw Zone' : '✦  Draw Zone on Map';
+    btn.classList.remove('drawing');
+  }
+}
+document.addEventListener('keydown', e => { if (e.key === 'Escape') cancelDraw(); });
 
 function renderZoneList() {
   const el = document.getElementById('zone-list');
@@ -808,7 +819,14 @@ function renderZoneLayers() {
   });
 }
 
-window.removeZone = function(i) {
+window.removeZone = async function(i) {
+  const zone = savedZones[i];
+  // Best-effort server-side delete (don't block local removal if offline)
+  if (zone && zone.id) {
+    try {
+      await fetch(API_BASE + '/alerts/' + zone.id, { method: 'DELETE' });
+    } catch (_) { /* ignore network errors — zone is removed locally regardless */ }
+  }
   savedZones.splice(i, 1);
   localStorage.setItem(ZONES_KEY, JSON.stringify(savedZones));
   renderZoneList();
@@ -822,12 +840,13 @@ document.getElementById('draw-zone-btn').addEventListener('click', function() {
   if (pendingLayer) { map.removeLayer(pendingLayer); pendingLayer = null; }
   document.getElementById('register-btn').style.display = 'none';
 
-  const handler = new L.Draw.Rectangle(map, {
+  activeDrawHandler = new L.Draw.Rectangle(map, {
     shapeOptions: { color: '#20c9c9', weight: 1.5, fillOpacity: 0.08, dashArray: '5 5' }
   });
-  handler.enable();
+  activeDrawHandler.enable();
 
   map.once(L.Draw.Event.CREATED, function(e) {
+    activeDrawHandler = null;
     pendingLayer = e.layer;
     pendingLayer.addTo(map);
     pendingBounds = e.layer.getBounds();
@@ -837,6 +856,7 @@ document.getElementById('draw-zone-btn').addEventListener('click', function() {
   });
 
   map.once(L.Draw.Event.DRAWSTOP, function() {
+    activeDrawHandler = null;
     if (!pendingBounds) {
       btn.textContent = '✦  Draw Zone on Map';
       btn.classList.remove('drawing');
@@ -844,7 +864,8 @@ document.getElementById('draw-zone-btn').addEventListener('click', function() {
   });
 });
 
-document.getElementById('register-btn').addEventListener('click', function() {
+document.getElementById('register-btn').addEventListener('click', async function() {
+  const btn = this;
   const emailEl = document.getElementById('alert-email');
   const email = emailEl.value.trim();
 
@@ -856,31 +877,65 @@ document.getElementById('register-btn').addEventListener('click', function() {
   }
   if (!pendingBounds) return;
 
-  const zone = {
+  const payload = {
     email,
     north: +pendingBounds.getNorth().toFixed(4),
     south: +pendingBounds.getSouth().toFixed(4),
     east:  +pendingBounds.getEast().toFixed(4),
     west:  +pendingBounds.getWest().toFixed(4),
-    created: new Date().toISOString()
   };
 
-  savedZones.push(zone);
-  localStorage.setItem(ZONES_KEY, JSON.stringify(savedZones));
-  renderZoneList();
-  renderZoneLayers();
+  btn.disabled = true;
+  btn.textContent = 'Registering…';
 
-  // Reset UI
-  if (pendingLayer) { map.removeLayer(pendingLayer); pendingLayer = null; }
-  pendingBounds = null;
-  emailEl.value = '';
-  document.getElementById('draw-zone-btn').textContent = '✦  Draw Zone on Map';
-  document.getElementById('register-btn').style.display = 'none';
+  try {
+    const res = await fetch(API_BASE + '/alerts', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const json = await res.json();
 
-  const conf = document.getElementById('confirm-msg');
-  conf.style.display = 'block';
-  conf.innerHTML = '✓ Zone registered for <strong>' + email + '</strong>. You will be notified when cases are reported within this boundary.';
-  setTimeout(() => { conf.style.display = 'none'; }, 6000);
+    if (!res.ok) {
+      const conf = document.getElementById('confirm-msg');
+      conf.style.display = 'block';
+      conf.style.borderColor = 'rgba(232,90,48,0.4)';
+      conf.innerHTML = '⚠ ' + (json.message || 'Registration failed. Please try again.');
+      setTimeout(() => { conf.style.display = 'none'; conf.style.borderColor = ''; }, 7000);
+      btn.disabled = false;
+      btn.textContent = 'Register Alert Zone';
+      return;
+    }
+
+    // Persist locally (id from server lets us DELETE later)
+    const zone = { ...payload, id: json.data.id, created: json.data.created_at };
+    savedZones.push(zone);
+    localStorage.setItem(ZONES_KEY, JSON.stringify(savedZones));
+    renderZoneList();
+    renderZoneLayers();
+
+    // Reset UI
+    if (pendingLayer) { map.removeLayer(pendingLayer); pendingLayer = null; }
+    pendingBounds = null;
+    emailEl.value = '';
+    document.getElementById('draw-zone-btn').textContent = '✦  Draw Zone on Map';
+    btn.style.display = 'none';
+
+    const conf = document.getElementById('confirm-msg');
+    conf.style.display = 'block';
+    conf.style.borderColor = '';
+    conf.innerHTML = '✓ Zone registered for <strong>' + email + '</strong>. You\'ll receive an email when confirmed cases appear within your boundary.';
+    setTimeout(() => { conf.style.display = 'none'; }, 7000);
+  } catch (err) {
+    const conf = document.getElementById('confirm-msg');
+    conf.style.display = 'block';
+    conf.style.borderColor = 'rgba(232,90,48,0.4)';
+    conf.innerHTML = '⚠ Network error — could not reach the server. Please try again.';
+    setTimeout(() => { conf.style.display = 'none'; conf.style.borderColor = ''; }, 7000);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Register Alert Zone';
+  }
 });
 
 // Check existing zones against current cases
